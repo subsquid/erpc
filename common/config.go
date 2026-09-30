@@ -1257,6 +1257,19 @@ type JsonRpcUpstreamConfig struct {
 	EnableGzip    *bool             `yaml:"enableGzip,omitempty" json:"enableGzip"`
 	Headers       map[string]string `yaml:"headers,omitempty" json:"headers"`
 	ProxyPool     string            `yaml:"proxyPool,omitempty" json:"proxyPool"`
+	// MaxResponseBytes caps the decoded size of one HTTP response body read from
+	// this upstream. The body is read into memory whole before it is parsed, so an
+	// upstream that answers a block-level trace with hundreds of MB can take the
+	// process past its memory limit. Over the cap the body is dropped mid-read and
+	// the call fails with ErrEndpointRequestTooLarge, "Response is too big". On EVM
+	// its JSON-RPC code is -32012, what a reth upstream's own cap turns into, so
+	// clients that already fall back on that error (e.g. tracing per transaction)
+	// do so here too; other architectures get -32603.
+	//
+	// Zero (the default) leaves responses unbounded; negative values are rejected.
+	// Unlike the other jsonRpc fields, a zero here inherits upstreamDefaults' cap
+	// even when the upstream sets its own jsonRpc block.
+	MaxResponseBytes int64 `yaml:"maxResponseBytes,omitempty" json:"maxResponseBytes"`
 }
 
 func (c *JsonRpcUpstreamConfig) Copy() *JsonRpcUpstreamConfig {
