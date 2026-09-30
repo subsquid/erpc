@@ -1041,6 +1041,10 @@ func (t *Tracker) RecordUpstreamFailure(up common.Upstream, method string, final
 	) {
 		return
 	}
+	// The upstream answered; eRPC dropped the body for its own maxResponseBytes.
+	if common.IsResponseSizeCapped(err) {
+		return
+	}
 
 
 	nowMs := time.Now().UnixMilli()

@@ -1807,6 +1807,40 @@ func TestApplyDefaults_UpstreamDefaultsSvm(t *testing.T) {
 	})
 }
 
+func TestApplyDefaults_UpstreamDefaultsMaxResponseBytes(t *testing.T) {
+	newDefaults := func() *UpstreamConfig {
+		return &UpstreamConfig{JsonRpc: &JsonRpcUpstreamConfig{MaxResponseBytes: 100 << 20}}
+	}
+
+	t.Run("upstream without a jsonRpc block inherits the cap", func(t *testing.T) {
+		u := &UpstreamConfig{Id: "u1", Type: UpstreamTypeEvm, Endpoint: "http://localhost:8545"}
+		require.NoError(t, u.ApplyDefaults(newDefaults()))
+
+		require.Equal(t, int64(100<<20), u.JsonRpc.MaxResponseBytes)
+	})
+
+	t.Run("upstream with its own jsonRpc block still inherits the cap", func(t *testing.T) {
+		u := &UpstreamConfig{
+			Id: "u1", Type: UpstreamTypeEvm, Endpoint: "http://localhost:8545",
+			JsonRpc: &JsonRpcUpstreamConfig{Headers: map[string]string{"Authorization": "Bearer x"}},
+		}
+		require.NoError(t, u.ApplyDefaults(newDefaults()))
+
+		require.Equal(t, int64(100<<20), u.JsonRpc.MaxResponseBytes)
+		require.Equal(t, "Bearer x", u.JsonRpc.Headers["Authorization"])
+	})
+
+	t.Run("upstream's own cap wins", func(t *testing.T) {
+		u := &UpstreamConfig{
+			Id: "u1", Type: UpstreamTypeEvm, Endpoint: "http://localhost:8545",
+			JsonRpc: &JsonRpcUpstreamConfig{MaxResponseBytes: 1 << 30},
+		}
+		require.NoError(t, u.ApplyDefaults(newDefaults()))
+
+		require.Equal(t, int64(1<<30), u.JsonRpc.MaxResponseBytes)
+	})
+}
+
 // Hook dispatch (architecture/evm/hooks.go) routes method names
 // case-insensitively, so the per-method config lookup must resolve the same
 // way — otherwise a non-canonical casing dispatches into method-specific logic

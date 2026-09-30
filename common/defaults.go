@@ -1849,6 +1849,14 @@ func (u *UpstreamConfig) ApplyDefaults(defaults *UpstreamConfig) error {
 			EnableGzip:    defaults.JsonRpc.EnableGzip,
 			ProxyPool:     defaults.JsonRpc.ProxyPool,
 			Headers:       defaults.JsonRpc.Headers,
+
+			MaxResponseBytes: defaults.JsonRpc.MaxResponseBytes,
+		}
+	} else if u.JsonRpc != nil && defaults.JsonRpc != nil {
+		// Field by field, unlike the rest of jsonRpc: a memory safety cap must not
+		// be lost because the upstream set its own headers or proxyPool.
+		if u.JsonRpc.MaxResponseBytes == 0 && defaults.JsonRpc.MaxResponseBytes != 0 {
+			u.JsonRpc.MaxResponseBytes = defaults.JsonRpc.MaxResponseBytes
 		}
 	}
 	if u.Grpc == nil && defaults.Grpc != nil {

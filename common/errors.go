@@ -2291,6 +2291,7 @@ type TooLargeComplaint string
 
 const EvmBlockRangeTooLarge TooLargeComplaint = "evm_block_range"
 const EvmAddressesTooLarge TooLargeComplaint = "evm_addresses"
+const ResponseSizeTooLarge TooLargeComplaint = "response_size"
 
 var NewErrEndpointRequestTooLarge = func(cause error, complaint TooLargeComplaint) error {
 	return &ErrEndpointRequestTooLarge{
@@ -2303,6 +2304,35 @@ var NewErrEndpointRequestTooLarge = func(cause error, complaint TooLargeComplain
 			},
 		},
 	}
+}
+
+// NewErrEndpointResponseTooLarge reports a response body eRPC itself dropped for
+// going over jsonRpc.maxResponseBytes. It keeps ErrEndpointRequestTooLarge's code so
+// retries and eth_getLogs/trace_filter splitting treat it like an upstream's own
+// size complaint.
+var NewErrEndpointResponseTooLarge = func(cause error, maxResponseBytes int64) error {
+	return &ErrEndpointRequestTooLarge{
+		BaseError{
+			Code:    ErrCodeEndpointRequestTooLarge,
+			Message: "upstream response exceeded jsonRpc.maxResponseBytes and was dropped by eRPC",
+			Cause:   cause,
+			Details: map[string]interface{}{
+				"complaint":        ResponseSizeTooLarge,
+				"maxResponseBytes": maxResponseBytes,
+			},
+		},
+	}
+}
+
+// IsResponseSizeCapped reports whether err is eRPC's own maxResponseBytes cap, as
+// opposed to a size complaint from the upstream.
+func IsResponseSizeCapped(err error) bool {
+	var tooLarge *ErrEndpointRequestTooLarge
+	if !errors.As(err, &tooLarge) {
+		return false
+	}
+
+	return tooLarge.Details["complaint"] == ResponseSizeTooLarge
 }
 
 func (e *ErrEndpointRequestTooLarge) ErrorStatusCode() int {

@@ -936,6 +936,20 @@ export interface JsonRpcUpstreamConfig {
   enableGzip?: boolean;
   headers?: { [key: string]: string};
   proxyPool?: string;
+  /**
+   * MaxResponseBytes caps the decoded size of one HTTP response body read from
+   * this upstream. The body is read into memory whole before it is parsed, so an
+   * upstream that answers a block-level trace with hundreds of MB can take the
+   * process past its memory limit. Over the cap the body is dropped mid-read and
+   * the call fails with ErrEndpointRequestTooLarge, "Response is too big". On EVM
+   * its JSON-RPC code is -32012, what a reth upstream's own cap turns into, so
+   * clients that already fall back on that error (e.g. tracing per transaction)
+   * do so here too; other architectures get -32603.
+   * Zero (the default) leaves responses unbounded; negative values are rejected.
+   * Unlike the other jsonRpc fields, a zero here inherits upstreamDefaults' cap
+   * even when the upstream sets its own jsonRpc block.
+   */
+  maxResponseBytes?: number /* int64 */;
 }
 /**
  * GrpcUpstreamConfig tunes a gRPC (grpc:// / grpc+bds://) upstream. It is the
