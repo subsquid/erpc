@@ -40,10 +40,11 @@ type GenericHttpJsonRpcClient struct {
 	httpClient      *http.Client
 	isLogLevelTrace bool
 
-	enableGzip    bool
-	supportsBatch bool
-	batchMaxSize  int
-	batchMaxWait  time.Duration
+	enableGzip       bool
+	supportsBatch    bool
+	maxResponseBytes int64
+	batchMaxSize     int
+	batchMaxWait     time.Duration
 
 	batchMu       sync.Mutex
 	batchRequests map[interface{}]*batchRequest
@@ -135,6 +136,8 @@ func NewGenericHttpJsonRpcClient(
 		if jsonRpcCfg.Headers != nil {
 			client.headers = jsonRpcCfg.Headers
 		}
+
+		client.maxResponseBytes = jsonRpcCfg.MaxResponseBytes
 
 		client.proxyPool = proxyPool
 	}
@@ -492,7 +495,19 @@ func (c *GenericHttpJsonRpcClient) processBatch(alreadyLocked bool) {
 }
 
 func (c *GenericHttpJsonRpcClient) processBatchResponse(requests map[interface{}]*batchRequest, resp *http.Response) {
-	bodyBytes, cleanup, err := c.readResponseBody(resp, int(resp.ContentLength))
+	bodyBytes, cleanup, err := c.readResponseBody(resp, expectedBodySize(resp, c.maxResponseBytes))
+	if errors.Is(err, errResponseTooBig) {
+		c.logger.Warn().
+			Int("batchSize", len(requests)).
+			Int64("maxResponseBytes", c.maxResponseBytes).
+			Msg("upstream batch response exceeded maxResponseBytes; dropped it")
+
+		// The cap covers the whole batch body, so every request in it fails.
+		for _, req := range requests {
+			req.err <- c.errResponseTooBig()
+		}
+		return
+	}
 	if err != nil {
 		for _, req := range requests {
 			req.err <- err
@@ -705,6 +720,7 @@ func (c *GenericHttpJsonRpcClient) sendSingleRequest(ctx context.Context, req *c
 		Params:  jrReq.Params,
 		ID:      jrReq.ID,
 	})
+	reqMethod := jrReq.Method
 	jrReq.RUnlock()
 	if err != nil {
 		common.SetTraceSpanError(span, err)
@@ -754,20 +770,33 @@ func (c *GenericHttpJsonRpcClient) sendSingleRequest(ctx context.Context, req *c
 	}
 	// DO NOT close resp.Body here - it will be closed by NormalizedResponse after reading
 
-	var bodyReader io.ReadCloser = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gzReader, err := c.gzipPool.GetReset(resp.Body)
-		if err != nil {
-			_ = resp.Body.Close() // Must close on error path
-			return nil, common.NewErrEndpointTransportFailure(c.Url, fmt.Errorf("cannot create gzip reader: %w", err))
+	bodyReader, capped, err := c.openBody(resp)
+	if err != nil {
+		_ = resp.Body.Close() // Must close on error path
+		if errors.Is(err, errResponseTooBig) {
+			err = c.responseTooBig(reqMethod)
+		} else {
+			err = common.NewErrEndpointTransportFailure(c.Url, err)
 		}
-		bodyReader = c.gzipPool.WrapGzipReader(gzReader)
+		common.SetTraceSpanError(span, err)
+		return nil, err
 	}
 
 	nr := common.NewNormalizedResponse().
 		WithRequest(req).
 		WithBody(bodyReader).
-		WithExpectedSize(int(resp.ContentLength))
+		WithExpectedSize(expectedBodySize(resp, c.maxResponseBytes))
+
+	// Parsing reads the body; only then is it known whether the cap was hit.
+	if capped != nil {
+		_, _ = nr.JsonRpcResponse(ctx)
+		if capped.Exceeded() {
+			nr.Release()
+			err := c.responseTooBig(reqMethod)
+			common.SetTraceSpanError(span, err)
+			return nil, err
+		}
+	}
 
 	err = c.normalizeJsonRpcError(resp, nr)
 	if err != nil {
@@ -843,21 +872,56 @@ func (c *GenericHttpJsonRpcClient) prepareRequest(ctx context.Context, body []by
 	return httpReq, nil
 }
 
-func (c *GenericHttpJsonRpcClient) readResponseBody(resp *http.Response, expectedSize int) ([]byte, func(), error) {
-	var reader io.ReadCloser = resp.Body
-	defer resp.Body.Close()
+// responseTooBig fails a single request whose upstream response went over maxResponseBytes.
+func (c *GenericHttpJsonRpcClient) responseTooBig(method string) error {
+	c.logger.Warn().
+		Str("method", method).
+		Int64("maxResponseBytes", c.maxResponseBytes).
+		Msg("upstream response exceeded maxResponseBytes; dropped it")
 
-	// Check if response is gzipped
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gr, err := c.gzipPool.GetReset(resp.Body)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error creating gzip reader: %w", err)
-		}
-		defer c.gzipPool.Put(gr)
-		reader = gr
+	return c.errResponseTooBig()
+}
+
+func (c *GenericHttpJsonRpcClient) errResponseTooBig() error {
+	return newErrResponseTooBig(c.upstream.Config().Type, c.maxResponseBytes)
+}
+
+// openBody returns the decoded response body, capped at maxResponseBytes when one
+// is set; the *cappedBody is nil otherwise. errResponseTooBig means Content-Length
+// already declares a body over the cap. The caller still owns resp.Body: closing a
+// gzip body does not close it.
+func (c *GenericHttpJsonRpcClient) openBody(resp *http.Response) (io.ReadCloser, *cappedBody, error) {
+	if c.maxResponseBytes > 0 && declaredTooBig(resp, c.maxResponseBytes) {
+		return nil, nil, errResponseTooBig
 	}
 
-	return util.ReadAll(reader, expectedSize)
+	var body io.ReadCloser = resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gzReader, err := c.gzipPool.GetReset(resp.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot create gzip reader: %w", err)
+		}
+		body = c.gzipPool.WrapGzipReader(gzReader)
+	}
+
+	if c.maxResponseBytes <= 0 {
+		return body, nil, nil
+	}
+
+	capped := newCappedBody(body, c.maxResponseBytes)
+	return capped, capped, nil
+}
+
+func (c *GenericHttpJsonRpcClient) readResponseBody(resp *http.Response, expectedSize int) ([]byte, func(), error) {
+	defer resp.Body.Close()
+
+	body, _, err := c.openBody(resp)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer body.Close()
+
+	return util.ReadAll(body, expectedSize)
 }
 
 func (c *GenericHttpJsonRpcClient) normalizeJsonRpcError(r *http.Response, nr *common.NormalizedResponse) error {
